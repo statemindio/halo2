@@ -442,7 +442,7 @@ pub struct MockProver<'a, F: Group + Field> {
     // This field is used only if the "phase_check" feature is turned on.
     advice_prev: Vec<Vec<CellValue<F>>>,
     // The instance cells in the circuit, arranged as [column][row].
-    instance: Vec<Vec<F>>,
+    instance: Vec<Vec<InstanceValue<F>>>,
 
     selectors_vec: Arc<Vec<Vec<bool>>>,
     selectors: Vec<&'a mut [bool]>,
@@ -458,6 +458,21 @@ pub struct MockProver<'a, F: Group + Field> {
     usable_rows: Range<usize>,
 
     current_phase: crate::plonk::sealed::Phase,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum InstanceValue<F: Field> {
+    Assigned(F),
+    Padding,
+}
+
+impl<F: Field> InstanceValue<F> {
+    fn value(&self) -> F {
+        match self {
+            InstanceValue::Assigned(v) => *v,
+            InstanceValue::Padding => F::zero(),
+        }
+    }
 }
 
 impl<'a, F: Field + Group> Assignment<F> for MockProver<'a, F> {
@@ -663,7 +678,7 @@ impl<'a, F: Field + Group> Assignment<F> for MockProver<'a, F> {
         self.instance
             .get(column.index())
             .and_then(|column| column.get(row))
-            .map(|v| circuit::Value::known(*v))
+            .map(|v| circuit::Value::known(v.value()))
             .ok_or(Error::BoundsFailure)
     }
 
@@ -904,13 +919,17 @@ impl<'a, F: FieldExt> MockProver<'a, F> {
 
         let instance = instance
             .into_iter()
-            .map(|mut instance| {
+            .map(|instance| {
                 if instance.len() > n - (cs.blinding_factors() + 1) {
                     return Err(Error::InstanceTooLarge);
                 }
 
-                instance.resize(n, F::zero());
-                Ok(instance)
+                let mut instance_values = vec![InstanceValue::Padding; n];
+                for (idx, value) in instance.into_iter().enumerate() {
+                    instance_values[idx] = InstanceValue::Assigned(value);
+                }
+
+                Ok(instance_values)
             })
             .collect::<Result<Vec<_>, _>>()?;
 
@@ -1141,16 +1160,42 @@ impl<'a, F: FieldExt> MockProver<'a, F> {
                                 let cell_row = ((gate_row + n + cell.rotation.0) % n) as usize;
 
                                 // Check that it was assigned!
-                                if r.cells.get(&(cell.column, cell_row)).is_some() {
-                                    None
-                                } else {
-                                    Some(VerifyFailure::CellNotAssigned {
-                                        gate: (gate_index, gate.name()).into(),
-                                        region: (r_i, r.name.clone(), r.annotations.clone()).into(),
-                                        gate_offset: *selector_row,
-                                        column: cell.column,
-                                        offset: cell_row as isize - r.rows.unwrap().0 as isize,
-                                    })
+                                match cell.column.column_type() {
+                                    Any::Instance => {
+                                        // Handle instance cells, which are not in the region.
+                                        let instance_value =
+                                            &self.instance[cell.column.index()][cell_row];
+                                        match instance_value {
+                                            InstanceValue::Assigned(_) => None,
+                                            _ => Some(VerifyFailure::InstanceCellNotAssigned {
+                                                gate: (gate_index, gate.name()).into(),
+                                                region: (r_i, r.name.clone()).into(),
+                                                gate_offset: *selector_row,
+                                                column: cell.column.try_into().unwrap(),
+                                                row: cell_row,
+                                            }),
+                                        }
+                                    }
+                                    _ => {
+                                        // Check that it was assigned!
+                                        if r.cells.contains_key(&(cell.column, cell_row)) {
+                                            None
+                                        } else {
+                                            Some(VerifyFailure::CellNotAssigned {
+                                                gate: (gate_index, gate.name()).into(),
+                                                region: (
+                                                    r_i,
+                                                    r.name.clone(),
+                                                    r.annotations.clone(),
+                                                )
+                                                    .into(),
+                                                gate_offset: *selector_row,
+                                                column: cell.column,
+                                                offset: cell_row as isize
+                                                    - r.rows.unwrap().0 as isize,
+                                            })
+                                        }
+                                    }
                                 }
                             })
                         })
@@ -1277,7 +1322,8 @@ impl<'a, F: FieldExt> MockProver<'a, F> {
                                 let rotation = query.1 .0;
                                 Value::Real(
                                     self.instance[column_index]
-                                        [(row as i32 + n + rotation) as usize % n as usize],
+                                        [(row as i32 + n + rotation) as usize % n as usize]
+                                        .value(),
                                 )
                             },
                             &|challenge| Value::Real(self.challenges[challenge.index()]),
@@ -1393,7 +1439,10 @@ impl<'a, F: FieldExt> MockProver<'a, F> {
                     .map(|c: &Column<Any>| match c.column_type() {
                         Any::Advice(_) => self.advice[c.index()][row],
                         Any::Fixed => self.fixed[c.index()][row],
-                        Any::Instance => CellValue::Assigned(self.instance[c.index()][row]),
+                        Any::Instance => {
+                            let cell: &InstanceValue<F> = &self.instance[c.index()][row];
+                            CellValue::Assigned(cell.value())                 
+                        }
                     })
                     .unwrap()
             };
@@ -1516,22 +1565,44 @@ impl<'a, F: FieldExt> MockProver<'a, F> {
                                             ((gate_row + n + cell.rotation.0) % n) as usize;
 
                                         // Check that it was assigned!
-                                        if r.cells.contains_key(&(cell.column, cell_row)) {
-                                            None
-                                        } else {
-                                            Some(VerifyFailure::CellNotAssigned {
-                                                gate: (gate_index, gate.name()).into(),
-                                                region: (
-                                                    r_i,
-                                                    r.name.clone(),
-                                                    r.annotations.clone(),
-                                                )
-                                                    .into(),
-                                                gate_offset: *selector_row,
-                                                column: cell.column,
-                                                offset: cell_row as isize
-                                                    - r.rows.unwrap().0 as isize,
-                                            })
+                                        match cell.column.column_type() {
+                                            Any::Instance => {
+                                                // Handle instance cells, which are not in the region.
+                                                let instance_value =
+                                                    &self.instance[cell.column.index()][cell_row];
+                                                match instance_value {
+                                                    InstanceValue::Assigned(_) => None,
+                                                    _ => Some(
+                                                        VerifyFailure::InstanceCellNotAssigned {
+                                                            gate: (gate_index, gate.name()).into(),
+                                                            region: (r_i, r.name.clone()).into(),
+                                                            gate_offset: *selector_row,
+                                                            column: cell.column.try_into().unwrap(),
+                                                            row: cell_row,
+                                                        },
+                                                    ),
+                                                }
+                                            }
+                                            _ => {
+                                                // Check that it was assigned!
+                                                if r.cells.contains_key(&(cell.column, cell_row)) {
+                                                    None
+                                                } else {
+                                                    Some(VerifyFailure::CellNotAssigned {
+                                                        gate: (gate_index, gate.name()).into(),
+                                                        region: (
+                                                            r_i,
+                                                            r.name.clone(),
+                                                            r.annotations.clone(),
+                                                        )
+                                                            .into(),
+                                                        gate_offset: *selector_row,
+                                                        column: cell.column,
+                                                        offset: cell_row as isize
+                                                            - r.rows.unwrap().0 as isize,
+                                                    })
+                                                }
+                                            }
                                         }
                                     })
                                     .collect::<Vec<_>>()
@@ -1656,7 +1727,8 @@ impl<'a, F: FieldExt> MockProver<'a, F> {
                             &|query| {
                                 Value::Real(
                                     self.instance[query.column_index]
-                                        [(row as i32 + n + query.rotation.0) as usize % n as usize],
+                                        [(row as i32 + n + query.rotation.0) as usize % n as usize]
+                                        .value(),
                                 )
                             },
                             &|challenge| Value::Real(self.challenges[challenge.index()]),
@@ -1767,7 +1839,10 @@ impl<'a, F: FieldExt> MockProver<'a, F> {
                     .map(|c: &Column<Any>| match c.column_type() {
                         Any::Advice(_) => self.advice[c.index()][row],
                         Any::Fixed => self.fixed[c.index()][row],
-                        Any::Instance => CellValue::Assigned(self.instance[c.index()][row]),
+                        Any::Instance => {
+                            let cell: &InstanceValue<F> = &self.instance[c.index()][row];
+                            CellValue::Assigned(cell.value())
+                        }                    
                     })
                     .unwrap()
             };

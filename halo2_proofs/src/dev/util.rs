@@ -3,7 +3,7 @@ use std::collections::BTreeMap;
 use group::ff::Field;
 use halo2curves::FieldExt;
 
-use super::{metadata, CellValue, Value};
+use super::{metadata, CellValue, Value, InstanceValue};
 use crate::{
     plonk::{
         Advice, AdviceQuery, Any, Column, ColumnType, Expression, FixedQuery, Gate, InstanceQuery,
@@ -105,13 +105,13 @@ pub(super) fn load_instance<'a, F: FieldExt, T: ColumnType, Q: Into<AnyQuery> + 
     n: i32,
     row: i32,
     queries: &'a [(Column<T>, Rotation)],
-    cells: &'a [Vec<F>],
+    cells: &'a [Vec<InstanceValue<F>>],
 ) -> impl Fn(Q) -> Value<F> + 'a {
     move |query| {
         let (column, at) = &queries[query.into().index];
         let resolved_row = (row + at.0 + n) % n;
-        Value::Real(cells[column.index()][resolved_row as usize])
-    }
+        let cell = &cells[column.index()][resolved_row as usize];
+        Value::Real(cell.value())    }
 }
 
 fn cell_value<'a, F: FieldExt, Q: Into<AnyQuery> + Copy>(

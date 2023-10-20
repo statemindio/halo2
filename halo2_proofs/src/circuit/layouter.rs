@@ -94,6 +94,11 @@ pub trait RegionLayouter<F: Field>: fmt::Debug {
         offset: usize,
     ) -> Result<(Cell, Value<F>), Error>;
 
+
+    /// Returns the value of the instance column's cell at absolute location `row`.
+    fn instance_value(&mut self, instance: Column<Instance>, row: usize
+    ) -> Result<Value<F>, Error>;
+
     /// Assign a fixed value
     fn assign_fixed<'v>(
         &'v mut self,
@@ -266,6 +271,14 @@ impl<F: Field> RegionLayouter<F> for RegionShape {
             },
             Value::unknown(),
         ))
+    }
+
+    fn instance_value(
+        &mut self,
+        _instance: Column<Instance>,
+        _row: usize,
+    ) -> Result<Value<F>, Error> {
+        Ok(Value::unknown())
     }
 
     fn assign_fixed<'v>(
